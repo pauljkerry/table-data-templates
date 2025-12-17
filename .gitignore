@@ -5,8 +5,6 @@ __pycache__/
 .npy
 .csv
 .tsv
-input/
-output/
 artifacts/wandb/
 docker-compose.yml
 *.pyc
