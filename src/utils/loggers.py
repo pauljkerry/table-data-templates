@@ -69,7 +69,7 @@ class WandbLogger:
         extra: dict | None = None,
         summary: dict | None = None
     ) -> None:
-        fno = fold_idx + 1
+        fno = fold_idx
         self._define_fold_metrics(axis_name, fno)
 
         if evals_result:
