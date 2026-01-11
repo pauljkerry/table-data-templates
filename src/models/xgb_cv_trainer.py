@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, List
 
 import cudf
+import cupy as cp
 import polars as pl
 import pyarrow.parquet as pq
 import xgboost as xgb
@@ -19,7 +20,7 @@ class ParquetIter(xgb.core.DataIter):
     features: list[str] = None
     target: str = "target"
     cat_cols: Optional[Iterable[str]] = None
-    fold_col: Optional[str] = None
+    folds: cp.array = None
     include_fold: str = None
     exclude_fold: str = None
     weight_col: Optional[str] = None
@@ -48,9 +49,9 @@ class ParquetIter(xgb.core.DataIter):
             cols.append(self.target)
         if (not self.predict_mode) and (self.weight_col in all_cols):
             cols.append(self.weight_col)
-        if (not self.predict_mode) and (self.fold_col in all_cols):
-            cols.append(self.fold_col)
         self._columns = list(dict.fromkeys(cols))
+        if "row_id" not in self._columns:
+            self._columns.append("row_id")
 
         # 内部状態
         self._reader = None
@@ -97,10 +98,23 @@ class ParquetIter(xgb.core.DataIter):
             # ※ cudf.read_parquet は単一ファイル向け。複数パスは「ループで回す」方針。
             gdf = cudf.read_parquet(path, columns=self._columns, row_groups=bundle)
 
-            if self.include_fold is not None:
-                gdf = gdf[gdf[self.fold_col] == self.include_fold]
-            if self.exclude_fold is not None:
-                gdf = gdf[gdf[self.fold_col] != self.exclude_fold]
+            if self.folds is not None:
+                # fold_df (row_id, fold) をマージ
+                gdf = gdf.merge(self.folds, on="row_id", how="inner")
+                gdf = gdf.sort_values("row_id")
+
+                # マージした fold 列を使ってフィルタリング
+                if self.include_fold is not None:
+                    gdf = gdf[gdf["fold"] == self.include_fold]
+                if self.exclude_fold is not None:
+                    gdf = gdf[gdf["fold"] != self.exclude_fold]
+
+                # 学習に使わないので fold 列と row_id (特徴量に含まれない場合) を削除
+                # ※ row_id が特徴量に含まれるなら残す
+                drop_cols = ["fold"]
+                if "row_id" not in self.features:
+                    drop_cols.append("row_id")
+                gdf.drop(columns=drop_cols, inplace=True, errors="ignore")
 
             # カテゴリ化（必要な列のみ）
             if self.cat_cols:
@@ -129,8 +143,8 @@ class XGBCVTrainer(BaseCVTrainer):
         self.log_axis_name = "iter"
 
         default_params = {
-            "objective": "binary:logistic",
-            "eval_metric": "auc",
+            "objective": "reg:squarederror",
+            "eval_metric": "rmse",
             "learning_rate": 0.1,
             "max_depth": 7,
             "min_child_weight": 10.0,
@@ -168,14 +182,19 @@ class XGBCVTrainer(BaseCVTrainer):
         # train() の引数として取り出す
         self.params = merged
 
+        self.fold_cudf = cudf.DataFrame(
+            self.fold_df.select(["row_id", "fold"]).to_numpy(),
+            columns=["row_id", "fold"]
+        )
+
     def train_model(self, fold) -> TrainResult:
         train_it = ParquetIter(
             paths=self.train_paths,
             features=self.features,
             target=self.target,
             cat_cols=self.cat_cols,
-            fold_col=self.fold_col,
             exclude_fold=fold,
+            folds=self.fold_cudf,
             weight_col=self.weight_col,
             gpu=True
         )
@@ -184,8 +203,8 @@ class XGBCVTrainer(BaseCVTrainer):
             features=self.features,
             target=self.target,
             cat_cols=self.cat_cols,
-            fold_col=self.fold_col,
             include_fold=fold,
+            folds=self.fold_cudf,
             weight_col=self.weight_col,
             gpu=self.gpu
         )
@@ -273,7 +292,6 @@ class XGBCVTrainer(BaseCVTrainer):
             features=self.features,
             target=self.target,
             cat_cols=self.cat_cols,
-            fold_col=self.fold_col,
             weight_col=self.weight_col,
             gpu=self.gpu
         )
