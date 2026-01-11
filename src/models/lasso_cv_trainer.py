@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import cudf
 import cupy as cp
+import polars as pl
 from cuml.linear_model import Lasso
 
 from src.models.base_cv_trainer import BaseCVTrainer, TrainResult
@@ -35,20 +36,20 @@ class LassoCVTrainer(BaseCVTrainer):
     def train_model(self, fold):
         train = cudf.read_parquet(
             self.train_paths,
-            columns=self.features + [self.target, self.fold_col]
+            columns=self.features + [self.target]
         )
 
         X_train = (
-            train[train[self.fold_col] != fold]
+            train[self.fold_df["fold"].to_numpy() != fold]
             [self.features].to_cupy().astype(cp.float32)
         )
         y_train = (
-            train[train[self.fold_col] != fold]
+            train[self.fold_df["fold"].to_numpy() != fold]
             [self.target].to_cupy().astype(cp.float32)
         )
 
         X_valid = (
-            train[train[self.fold_col] == fold]
+            train[self.fold_df["fold"].to_numpy() == fold]
             [self.features].to_cupy().astype(cp.float32)
         )
 
@@ -61,12 +62,45 @@ class LassoCVTrainer(BaseCVTrainer):
         model = Lasso(**self.params)
         model.fit(X_train, y_train)
 
+        # === ここから: 係数とBiasの抽出 ===
+        
+        # 1. 係数 (Coefficients) の取得
+        # GPU(CuPy)にある場合はCPU(NumPy)に戻す
+        coefs = model.coef_
+        if hasattr(coefs, "get"):
+            coefs = coefs.get()
+        # 形状が (1, n_features) のようになっている場合があるので1次元にならす
+        coefs = coefs.ravel()
+
+        # 2. 切片 (Bias / Intercept) の取得
+        intercept = model.intercept_
+        if hasattr(intercept, "get"):
+            intercept = intercept.get() # スカラー値または1要素の配列
+        # float型に変換しておく
+        intercept = float(intercept)
+
+        # 3. DataFrame作成 (XGBoostと同じ形式)
+        # 特徴量の係数
+        fi_df = pl.DataFrame({
+            "Feature": self.features,
+            "Importance": coefs
+        })
+
+        # Biasも表に含める場合（講義用ならあると分かりやすいです）
+        bias_df = pl.DataFrame({
+            "Feature": ["Intercept (Bias)"],
+            "Importance": [intercept]
+        }).with_columns(pl.col("Importance").cast(pl.Float32))
+        
+        # 縦に結合
+        fi_df = pl.concat([fi_df, bias_df])
+
         return TrainResult(
             model=model,
             val_pred=model.predict(X_valid).get(),
             evals_result=None,
             extra=None,
-            fi=None,
+            fi=fi_df,
             best_iteration=None
         )
 
