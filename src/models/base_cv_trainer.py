@@ -11,8 +11,7 @@ import numpy as np
 import polars as pl
 import rmm.mr as mr
 from rmm.allocators.cupy import rmm_cupy_allocator
-from sklearn.metrics import roc_auc_score
-from sklearn.metrics import log_loss
+from sklearn.metrics import mean_squared_error
 
 from src.utils.loggers import CVLogger, NoOpLogger
 from src.utils.print_duration import print_duration
@@ -38,13 +37,12 @@ class BaseCVTrainer(ABC):
     test_paths: str | list[str] | None = None
     features: Optional[list[str]] = None
     target: str = "target"
-    fold_col: Optional[str] = None
+    fold_name: Optional[str] = None
     weight_col: Optional[str] = None
     cat_cols: Optional[list[str]] = None
 
     params: dict = field(default_factory=dict)
 
-    n_folds: int = 5
     seed: int = 42
     gpu: bool = True
 
@@ -67,24 +65,24 @@ class BaseCVTrainer(ABC):
             pl.scan_parquet(self.test_paths) if self.test_paths else None
         )
 
-        self.rep_metric = "auc"
+        self.rep_metric = "rmse"
         self.metrics = {
-            "accuracy": lambda y, p: np.mean(
-                [y_i == (1 if p_i > 0.5 else 0) for y_i, p_i in zip(y, p)]
-            ),
-            "log_loss": log_loss,
-            "auc": roc_auc_score
+            "rmse": lambda y, t: np.sqrt(mean_squared_error(y, t)),
         }
         hdr = pl.read_parquet(self.train_paths, n_rows=0)
         self.all_cols = pl.read_parquet(self.train_paths, n_rows=0).columns
 
-        if self.fold_col is None:
-            self.fold_col = f"{self.n_folds}fold-s{self.seed}"
+        self.fold_df = (
+             pl.read_parquet(f"../../artifacts/folds/{self.fold_name}.parquet")
+             .sort("row_id")  # 一応ソート
+        )
+        self.unique_folds = np.sort(self.fold_df["fold"].unique().to_numpy())
+        self.n_folds = len(self.unique_folds)
 
-        if self.fold_col not in self.all_cols:
-            raise ValueError(f"fold_col not found in dataset: {self.fold_col}")
-        else:
-            print(f"Fold Col: {self.fold_col}")
+        print(
+            f"Loaded folds data. Detected {self.n_folds} "
+            f"folds: {self.unique_folds}"
+        )
 
         if self.cat_cols is None:
             self.cat_cols = [
@@ -95,21 +93,14 @@ class BaseCVTrainer(ABC):
         if self.features is None:
             meta = {
                 c
-                for c in ("row_id", self.target, self.weight_col, self.fold_col)
+                for c in ("row_id", self.target, self.weight_col)
                 if c and c in self.all_cols
             }
-            pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
+
             self.features = [
                 c for c in self.all_cols
-                if c not in meta and not pat.fullmatch(c)
+                if c not in meta
             ]
-
-        self.fold_df = (
-            pl.read_parquet(
-                self.train_paths,
-                columns=["row_id", self.fold_col]
-            )
-        )
 
         dev_mr = mr.CudaAsyncMemoryResource()
         mr.set_current_device_resource(dev_mr)
@@ -136,7 +127,7 @@ class BaseCVTrainer(ABC):
         meta = {
             "data_id": self.data_id,
             "seed": self.seed,
-            "n_folds": self.n_folds,
+            "fold_name": self.fold_name,
             **self.params,
             **self.opts
         }
@@ -163,32 +154,24 @@ class BaseCVTrainer(ABC):
         fold_scores = {name: [] for name in self.metrics.keys()}
         fi_list = []
 
-        fold_df = (
-            pl.read_parquet(
-                self.train_paths,
-                columns=["row_id", self.fold_col]
-            )
-        )
         if full_train:
             return self._run_full_train(loggers, t_total_start)
 
-        for fold in range(1, self.n_folds+1):
-            title = f" Fold {fold} / {self.n_folds} "
+        for i, fold in enumerate(self.unique_folds):
+            title = f" Fold {i+1} / {self.n_folds} "
             print("=" * 48)
             print(f"{title:=^48}")
             print("=" * 48)
             print(f"Free CPU Mem: {round(free_ram_gib(), 2)} GB")
             print(f"Free GPU Mem: {round(free_vram_gib(), 2)} GB")
-
             t_fold_start = now()
             fold_summary = {}
 
             val_idx = (
-                fold_df
-                .filter(pl.col(self.fold_col) == fold)
+                self.fold_df
+                .filter(pl.col("fold") == fold)
                 .get_column("row_id")
-                .to_numpy()
-                .astype(np.int32, copy=False)
+                .to_list()
             )
 
             train_result: TrainResult = self.train_model(fold)
@@ -201,11 +184,13 @@ class BaseCVTrainer(ABC):
 
             y_valid = (
                 pl.read_parquet(
-                    self.train_paths, columns=[self.target, self.fold_col]
-                ).filter(pl.col(self.fold_col) == fold)
+                    self.train_paths, columns=[self.target, "row_id"]
+                )
+                .filter(pl.col("row_id").is_in(val_idx))
+                .sort("row_id")
                 .select(self.target)
                 .to_numpy()
-                .astype(np.int32)
+                .astype(np.float32)
                 .ravel()
             )
 
