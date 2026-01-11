@@ -32,7 +32,7 @@ class ParquetStream(IterableDataset):
     mean: np.ndarray
     std: np.ndarray
 
-    fold_col: Optional[str] = None
+    folds: cudf.DataFrame = None
     include_fold: int = None
     exclude_fold: int = None
     weight_col: Optional[str] = None
@@ -75,14 +75,10 @@ class ParquetStream(IterableDataset):
             and (self.weight_col in all_cols)
         ):
             cols.append(self.weight_col)
-        if (
-            (not self.predict_mode)
-            and self.fold_col
-            and (self.fold_col in all_cols)
-        ):
-            cols.append(self.fold_col)
 
         self._columns = list(dict.fromkeys(cols))
+        if "row_id" not in self._columns:
+            self._columns.append("row_id")
 
         self._norm_idxs = cp.asarray(
             self.num_idxs, dtype=cp.int64
@@ -128,10 +124,23 @@ class ParquetStream(IterableDataset):
                 if len(gdf) == 0:
                     continue
 
+            if self.folds is not None:
+                # fold_df (row_id, fold) をマージ
+                gdf = gdf.merge(self.folds, on="row_id", how="inner")
+                gdf = gdf.sort_values("row_id")
+
+                # マージした fold 列を使ってフィルタリング
                 if self.include_fold is not None:
-                    gdf = gdf[gdf[self.fold_col] == self.include_fold]
+                    gdf = gdf[gdf["fold"] == self.include_fold]
                 if self.exclude_fold is not None:
-                    gdf = gdf[gdf[self.fold_col] != self.exclude_fold]
+                    gdf = gdf[gdf["fold"] != self.exclude_fold]
+
+                # 学習に使わないので fold 列と row_id (特徴量に含まれない場合) を削除
+                # ※ row_id が特徴量に含まれるなら残す
+                drop_cols = ["fold"]
+                if "row_id" not in self.features:
+                    drop_cols.append("row_id")
+                gdf.drop(columns=drop_cols, inplace=True, errors="ignore")
 
                 # GPU 内シャッフル
                 if self.shuffle:
@@ -327,7 +336,7 @@ class MLPCVTrainer(BaseCVTrainer):
         if self.features is None:
             meta = {
                 c
-                for c in ("row_id", self.target, self.weight_col, self.fold_col)
+                for c in ("row_id", self.target, self.weight_col)
                 if c and c in self.all_cols
             }
             pat = re.compile(r"^\d+fold(?:-[A-Za-z0-9]+)?$")
@@ -377,7 +386,7 @@ class MLPCVTrainer(BaseCVTrainer):
             self.num_idxs,
             self.mean,
             self.std,
-            fold_col=self.fold_col,
+            folds=self.fold_cudf,
             exclude_fold=fold,
             weight_col=self.weight_col,
             batch_size=self.params["batch_size"],
@@ -392,7 +401,7 @@ class MLPCVTrainer(BaseCVTrainer):
             self.num_idxs,
             self.mean,
             self.std,
-            fold_col=self.fold_col,
+            folds=self.fold_cudf,
             include_fold=fold,
             batch_size=self.params["batch_size"],
             predict_mode=False,
@@ -412,13 +421,22 @@ class MLPCVTrainer(BaseCVTrainer):
             shuffle=False
         )
 
+        val_idx = (
+            self.fold_df
+            .filter(pl.col("fold") == fold)
+            .get_column("row_id")
+            .to_list()
+        )
+
         y_val = (
             pl.read_parquet(
-                self.train_paths, columns=[self.target, self.fold_col]
-            ).filter(pl.col(self.fold_col) == fold)
+                self.train_paths, columns=[self.target, "row_id"]
+            )
+            .filter(pl.col("row_id").is_in(val_idx))
+            .sort("row_id")
             .select(self.target)
             .to_numpy()
-            .astype(np.int32)
+            .astype(np.float32)
             .ravel()
         )
 
@@ -573,7 +591,7 @@ class MLPCVTrainer(BaseCVTrainer):
             self.num_idxs,
             self.mean,
             self.std,
-            fold_col=self.fold_col,
+            folds=self.fold_cudf,
             batch_size=self.params["batch_size"],
             predict_mode=True,
             seed=self.seed,
