@@ -173,8 +173,8 @@ _REGISTRY: dict[str, SearchSpace] = {
 def create_objective(
     model_type: str,
     data_id: int,
+    fold_name: str,
     seed: int = 42,
-    n_folds: int = 5,
     wandb_project: str = "project",
     study_name: str = "study",
     opts: dict | None = None
@@ -200,7 +200,7 @@ def create_objective(
             job_type="optuna-search",
             config={
                 "data_id": data_id,
-                "n_folds": n_folds,
+                "fold_name": fold_name,
                 "level": level,
                 "model": model_type,
             },
@@ -212,7 +212,7 @@ def create_objective(
             trainer = Trainer(
                 data_id,
                 train_paths,
-                n_folds=n_folds,
+                fold_name=fold_name,
                 params=params,
                 seed=seed,
                 opts=opts
@@ -226,7 +226,7 @@ def create_objective(
             path = optuna_dir / f"{study_name}/trl{trial.number}.json"
             manifest = {
                 "params": params,
-                "n_folds": n_folds,
+                "fold_name": fold_name,
                 "seed": seed,
                 "wandb_id": run.id,
                 "wandb_url": run.url,
