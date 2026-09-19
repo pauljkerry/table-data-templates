@@ -102,6 +102,12 @@ class BaseCVTrainer(ABC):
                 if c not in meta
             ]
 
+        train_ids = self.lf_train.select("row_id").collect().get_column("row_id")
+        fold_ids = self.fold_df.get_column("row_id")
+
+        if not train_ids.equals(fold_ids):
+            raise ValueError("Row ID mismatch! Sort order is different.")
+
         dev_mr = mr.CudaAsyncMemoryResource()
         mr.set_current_device_resource(dev_mr)
         rmm.reinitialize(
@@ -158,7 +164,8 @@ class BaseCVTrainer(ABC):
             return self._run_full_train(loggers, t_total_start)
 
         for i, fold in enumerate(self.unique_folds):
-            title = f" Fold {i+1} / {self.n_folds} "
+            fno = i+1
+            title = f" Fold {fno} / {self.n_folds} "
             print("=" * 48)
             print(f"{title:=^48}")
             print("=" * 48)
@@ -201,12 +208,12 @@ class BaseCVTrainer(ABC):
                 fold_scores[name].append(val_score)
 
             fold_summary["runtime"] = print_duration(
-                t_fold_start, now(), f"Fold {fold} Runtime"
+                t_fold_start, now(), f"Fold {fno} Runtime"
             )
 
             for lg in loggers:
                 lg.on_fold_end(
-                    fold,
+                    fno,
                     axis_name=self.log_axis_name,
                     evals_result=train_result.evals_result,
                     extra=train_result.extra,
